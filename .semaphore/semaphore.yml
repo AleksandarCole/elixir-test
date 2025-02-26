@@ -6,11 +6,18 @@ agent:
     os_image: ''
   containers:
     - name: main
-      image: 'registry.semaphoreci.com/elixir:1.15'
+      image: 'elixir:1.15'
     - name: postgres
-      image: 'registry.semaphoreci.com/postgres:17'
+      image: 'postgres:17'
+      env_vars:
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_DB
+          value: app_test
     - name: redis
-      image: 'registry.semaphoreci.com/redis:7.0'
+      image: 'redis:7.0'
 fail_fast:
   stop:
     when: branch != 'main'
@@ -25,8 +32,11 @@ global_job_config:
       - checkout
       - mix local.hex --force
       - mix local.rebar --force
+      - cache restore mix-deps-$(checksum mix.lock)
+      - cache restore build-$(checksum mix.lock)
+      - cache restore npm-modules-$(checksum assets/package-lock.json)
+      - cache restore plt-cache
       - mix deps.get
-      - cache restore
 blocks:
   - name: "\U0001F6E0️ Setup and Cache"
     dependencies: []
@@ -36,8 +46,12 @@ blocks:
           commands:
             - mix deps.compile
             - mix compile
-            - npm ci --prefix assets
-            - cache store
+            - cd assets && npm ci
+            - cache store mix-deps-$(checksum mix.lock) deps
+            - cache store build-$(checksum mix.lock) _build
+            - cache store npm-modules-$(checksum assets/package-lock.json) assets/node_modules
+            - mkdir -p priv/plts
+            - cache store plt-cache priv/plts
   - name: "\U0001F3A8 Assets"
     dependencies:
       - "\U0001F6E0️ Setup and Cache"
@@ -45,7 +59,7 @@ blocks:
       jobs:
         - name: "\U0001F58C️ Compile Assets"
           commands:
-            - npm run deploy --prefix assets
+            - cd assets && npm run deploy
             - mix phx.digest
   - name: "\U0001F50D Code Quality"
     dependencies:
@@ -66,7 +80,7 @@ blocks:
           commands:
             - mix deps.audit
             - mix sobelow --config
-            - cd assets && npm audit
+            - cd assets && npm audit --production
   - name: "\U0001F4CA Dialyzer"
     dependencies:
       - "\U0001F6E0️ Setup and Cache"
@@ -74,7 +88,7 @@ blocks:
       jobs:
         - name: "\U0001F50E Type Checking"
           commands:
-            - mix dialyzer
+            - mix dialyzer --plt
   - name: "\U0001F9EA Test Suite"
     dependencies:
       - "\U0001F6E0️ Setup and Cache"
@@ -84,29 +98,68 @@ blocks:
         - name: MIX_ENV
           value: test
         - name: DATABASE_URL
-          value: 'postgresql://postgres@postgres:5432/app_test'
+          value: 'postgresql://postgres:postgres@localhost:5432/app_test'
+        - name: PGHOST
+          value: localhost
+        - name: PGUSER
+          value: postgres
+        - name: PGPASSWORD
+          value: postgres
         - name: REDIS_URL
-          value: 'redis://redis:6379'
+          value: 'redis://localhost:6379'
       jobs:
         - name: "\U0001F7E2 ExUnit Tests"
           parallelism: 4
           commands:
             - mix ecto.create
             - mix ecto.migrate
-            - mix test --cover
+            - mix test --cover --partitions $SEMAPHORE_JOB_COUNT --partition $SEMAPHORE_JOB_INDEX
+      epilogue:
+        always:
+          commands:
+            - mix coveralls.json || true
+            - test-results publish coverage.json || true
   - name: "\U0001F310 Browser Tests"
     dependencies:
       - "\U0001F9EA Test Suite"
     task:
+      env_vars:
+        - name: MIX_ENV
+          value: test
+        - name: DATABASE_URL
+          value: 'postgresql://postgres:postgres@localhost:5432/app_test'
+        - name: PGHOST
+          value: localhost
+        - name: PGUSER
+          value: postgres
+        - name: PGPASSWORD
+          value: postgres
+        - name: REDIS_URL
+          value: 'redis://localhost:6379'
       jobs:
         - name: "\U0001F3AD Wallaby Tests"
           commands:
-            - mix wallaby.install
+            - apt-get update && apt-get install -y wget gnupg ca-certificates
+            - 'wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -'
+            - 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google.list'
+            - apt-get update && apt-get install -y google-chrome-stable
+            - mix wallaby.install chrome
             - 'mix test --only browser:true'
   - name: "\U0001F680 Deploy Checks"
     dependencies:
       - "\U0001F9EA Test Suite"
     task:
+      env_vars:
+        - name: MIX_ENV
+          value: prod
+        - name: DATABASE_URL
+          value: 'postgresql://postgres:postgres@localhost:5432/app_test'
+        - name: PGHOST
+          value: localhost
+        - name: PGUSER
+          value: postgres
+        - name: PGPASSWORD
+          value: postgres
       jobs:
         - name: "\U0001F504 Migration Safety"
           commands:
@@ -126,4 +179,6 @@ blocks:
           commands:
             - 'echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin'
             - 'docker build -t "${DOCKER_USERNAME}/phoenix-app:${SEMAPHORE_GIT_SHA:0:7}" .'
+            - 'docker tag "${DOCKER_USERNAME}/phoenix-app:${SEMAPHORE_GIT_SHA:0:7}" "${DOCKER_USERNAME}/phoenix-app:latest"'
             - 'docker push "${DOCKER_USERNAME}/phoenix-app:${SEMAPHORE_GIT_SHA:0:7}"'
+            - 'docker push "${DOCKER_USERNAME}/phoenix-app:latest"'
